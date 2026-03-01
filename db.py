@@ -958,6 +958,76 @@ def clear_detections_for_game(game_id):
         """, (game_id,))
 
 
+def delete_game(game_id):
+    """Cascade delete a game and all associated data (detections, rallies, stats, sets)."""
+    with get_connection() as conn:
+        # Get all set IDs for this game
+        set_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM sets WHERE game_id = ?", (game_id,)
+        ).fetchall()]
+
+        if set_ids:
+            placeholders = ", ".join("?" for _ in set_ids)
+
+            # 1. Delete player_detections (via rallies -> sets)
+            conn.execute(f"""
+                DELETE FROM player_detections
+                WHERE rally_id IN (
+                    SELECT id FROM rallies WHERE set_id IN ({placeholders})
+                )
+            """, set_ids)
+
+            # 2. Delete rallies
+            conn.execute(
+                f"DELETE FROM rallies WHERE set_id IN ({placeholders})", set_ids
+            )
+
+            # 3. Delete player_set_stats
+            conn.execute(
+                f"DELETE FROM player_set_stats WHERE set_id IN ({placeholders})", set_ids
+            )
+
+        # 4. Delete sets
+        conn.execute("DELETE FROM sets WHERE game_id = ?", (game_id,))
+
+        # 5. Delete game
+        conn.execute("DELETE FROM games WHERE id = ?", (game_id,))
+
+
+def delete_team(team_id):
+    """Cascade delete a team: all games it played in, its players, and the team itself."""
+    with get_connection() as conn:
+        # Find all games this team played in (home or away)
+        game_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM games WHERE home_team_id = ? OR away_team_id = ?",
+            (team_id, team_id),
+        ).fetchall()]
+
+    # Delete each game with full cascade
+    for gid in game_ids:
+        delete_game(gid)
+
+    with get_connection() as conn:
+        # Get player IDs for this team
+        player_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM players WHERE team_id = ?", (team_id,)
+        ).fetchall()]
+
+        # Delete any remaining player_set_stats for these players
+        if player_ids:
+            placeholders = ", ".join("?" for _ in player_ids)
+            conn.execute(
+                f"DELETE FROM player_set_stats WHERE player_id IN ({placeholders})",
+                player_ids,
+            )
+
+        # Delete players
+        conn.execute("DELETE FROM players WHERE team_id = ?", (team_id,))
+
+        # Delete team
+        conn.execute("DELETE FROM teams WHERE id = ?", (team_id,))
+
+
 def get_all_players_list():
     """Return all players with team info."""
     with get_connection() as conn:
@@ -979,3 +1049,22 @@ def get_rallies_for_game(game_id):
             WHERE s.game_id = ?
             ORDER BY s.set_number, r.rally_number
         """, (game_id,)).fetchall()]
+
+
+def get_detections_for_game(game_id):
+    """Batch fetch all player_detections for a game, keyed by rally_id."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT pd.*
+            FROM player_detections pd
+            JOIN rallies r ON pd.rally_id = r.id
+            JOIN sets s ON r.set_id = s.id
+            WHERE s.game_id = ?
+            ORDER BY pd.rally_id, pd.frame_timestamp
+        """, (game_id,)).fetchall()
+        result = {}
+        for row in rows:
+            d = dict(row)
+            rid = d["rally_id"]
+            result.setdefault(rid, []).append(d)
+        return result

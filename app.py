@@ -5,8 +5,10 @@ Season Analytics, Teams, Players, Export.  Data persisted in SQLite via db.py.
 """
 
 import io
+import re
 import datetime
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import streamlit as st
 import pandas as pd
@@ -241,14 +243,27 @@ def page_games():
         st.info("No games found. Create one from the New Game page.")
         return
 
-    # Filters
-    col1, col2 = st.columns(2)
+    # Filters & sorting
+    col1, col2, col3 = st.columns(3)
     with col1:
         teams = db.get_all_teams()
         team_filter = st.selectbox("Filter by team", ["All"] + [t["name"] for t in teams], key="games_team_filter")
     with col2:
         status_filter = st.selectbox("Filter by status", ["All", "completed", "analyzing", "pending", "error"],
                                      key="games_status_filter")
+    with col3:
+        sort_option = st.selectbox("Sort by", ["Date (newest)", "Date (oldest)", "Home Team A-Z", "Away Team A-Z"],
+                                   key="games_sort")
+
+    # Sort games
+    if sort_option == "Date (newest)":
+        games.sort(key=lambda g: g.get("date") or "", reverse=True)
+    elif sort_option == "Date (oldest)":
+        games.sort(key=lambda g: g.get("date") or "")
+    elif sort_option == "Home Team A-Z":
+        games.sort(key=lambda g: (g.get("home_team_name") or "").lower())
+    elif sort_option == "Away Team A-Z":
+        games.sort(key=lambda g: (g.get("away_team_name") or "").lower())
 
     for g in games:
         # Apply filters
@@ -261,12 +276,18 @@ def page_games():
         sets = db.get_sets_for_game(g["id"])
         set_scores = "  |  ".join(f"S{s['set_number']}: {s['home_score']}-{s['away_score']}" for s in sets)
 
-        cols = st.columns([3, 2, 2, 1])
+        cols = st.columns([3, 2, 2, 1, 1])
         cols[0].write(f"**{g['home_abbr']} vs {g['away_abbr']}**")
         cols[1].write(f"{g.get('date', '')}  —  {set_scores}")
         cols[2].write(f"Status: {g.get('status', 'unknown')}")
         if cols[3].button("View", key=f"games_view_{g['id']}"):
             nav("Game Detail", selected_game_id=g["id"])
+        with cols[4].popover("Delete"):
+            st.warning(f"Delete **{g['home_abbr']} vs {g['away_abbr']}** ({g.get('date', '')})? This removes all sets, rallies, stats, and detections.")
+            if st.button("Confirm Delete", key=f"games_del_{g['id']}", type="primary"):
+                db.delete_game(g["id"])
+                st.success("Game deleted.")
+                st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -290,41 +311,323 @@ def page_game_detail():
     sets = db.get_sets_for_game(game_id)
 
     tabs = st.tabs([
-        "Match Overview", "Rally Log", "Player Stats", "Team Comparison",
-        "Rotation Analysis", "Score Progression", "Video Clips", "Scouting Notes"
+        "Match Overview", "Play by Play", "Rally Log", "Player Stats",
+        "Team Comparison", "Rotation Analysis", "Score Progression",
+        "Video Clips", "Scouting Notes"
     ])
 
     # ── Tab 1: Match Overview ────────────────────────────────────────────────
     with tabs[0]:
         _tab_match_overview(game, sets)
 
-    # ── Tab 2: Rally Log ─────────────────────────────────────────────────────
+    # ── Tab 2: Play by Play ──────────────────────────────────────────────────
     with tabs[1]:
+        _tab_play_by_play(game, sets)
+
+    # ── Tab 3: Rally Log ─────────────────────────────────────────────────────
+    with tabs[2]:
         _tab_rally_log(game, sets)
 
-    # ── Tab 3: Player Stats ──────────────────────────────────────────────────
-    with tabs[2]:
+    # ── Tab 4: Player Stats ──────────────────────────────────────────────────
+    with tabs[3]:
         _tab_player_stats(game, sets)
 
-    # ── Tab 4: Team Comparison ───────────────────────────────────────────────
-    with tabs[3]:
+    # ── Tab 5: Team Comparison ───────────────────────────────────────────────
+    with tabs[4]:
         _tab_team_comparison(game)
 
-    # ── Tab 5: Rotation Analysis ─────────────────────────────────────────────
-    with tabs[4]:
+    # ── Tab 6: Rotation Analysis ─────────────────────────────────────────────
+    with tabs[5]:
         _tab_rotation_analysis(game, sets)
 
-    # ── Tab 6: Score Progression ─────────────────────────────────────────────
-    with tabs[5]:
+    # ── Tab 7: Score Progression ─────────────────────────────────────────────
+    with tabs[6]:
         _tab_score_progression(game, sets)
 
-    # ── Tab 7: Video Clips ───────────────────────────────────────────────────
-    with tabs[6]:
+    # ── Tab 8: Video Clips ───────────────────────────────────────────────────
+    with tabs[7]:
         _tab_video_clips(game, sets)
 
-    # ── Tab 8: Scouting Notes ────────────────────────────────────────────────
-    with tabs[7]:
+    # ── Tab 9: Scouting Notes ────────────────────────────────────────────────
+    with tabs[8]:
         _tab_scouting_notes(game)
+
+
+def _video_timestamp_url(video_url, video_time_str):
+    """Convert a video URL + timestamp like '22:27' into a YouTube link with &t=Xs."""
+    if not video_url or not video_time_str:
+        return None
+    # Parse the time string (MM:SS or H:MM:SS)
+    parts = video_time_str.strip().split(":")
+    try:
+        if len(parts) == 2:
+            total_seconds = int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            total_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+        else:
+            return None
+    except ValueError:
+        return None
+    # Extract YouTube video ID
+    parsed = urlparse(video_url)
+    if "youtube.com" in parsed.hostname or "youtu.be" in parsed.hostname:
+        if "youtu.be" in parsed.hostname:
+            vid = parsed.path.lstrip("/")
+        else:
+            vid = parse_qs(parsed.query).get("v", [None])[0]
+        if vid:
+            return f"https://www.youtube.com/watch?v={vid}&t={total_seconds}s"
+    return None
+
+
+def _format_play_description(rally, home_abbr, away_abbr):
+    """Return a one-line natural language description of the rally."""
+    scoring = rally.get("scoring_team", "")
+    play_type = rally.get("play_type", "")
+    key_player = rally.get("key_player", "")
+    serving = rally.get("serving_team", "")
+    is_sideout = rally.get("is_sideout", 0)
+
+    team_name = scoring if scoring else "Unknown"
+
+    # key_player already has '#' prefix in the data (e.g. "#8 (HOL)" or "UKC #15?")
+    if play_type and "ace" in play_type.lower():
+        desc = f"{team_name} aces"
+        if key_player:
+            desc += f" with {key_player} serving"
+    elif play_type and "kill" in play_type.lower():
+        desc = f"{team_name} scores on a Kill"
+        if key_player:
+            desc += f" by {key_player}"
+    elif play_type and "service error" in play_type.lower():
+        desc = f"{team_name} scores on a Service Error"
+        if serving:
+            desc += f" by {serving}"
+    elif play_type and "block" in play_type.lower():
+        desc = f"{team_name} scores on a Block"
+        if key_player:
+            desc += f" by {key_player}"
+    else:
+        desc = f"{team_name} scores"
+        if play_type:
+            desc += f" ({play_type})"
+        if key_player:
+            desc += f" — {key_player}"
+
+    if is_sideout:
+        desc += " — sideout"
+    return desc
+
+
+def _play_type_color(play_type):
+    """Return a CSS color for the play type badge."""
+    if not play_type:
+        return "#888"
+    pt = play_type.lower()
+    if "ace" in pt:
+        return "#2e7d32"  # green
+    if "service error" in pt:
+        return "#c62828"  # red
+    if "kill" in pt:
+        return "#1565c0"  # blue
+    if "block" in pt:
+        return "#6a1b9a"  # purple
+    return "#888"  # gray
+
+
+def _tab_play_by_play(game, sets):
+    """Read-only, coach-friendly play-by-play view with YouTube timestamps."""
+    if not sets:
+        st.info("No sets recorded for this game yet.")
+        return
+
+    home_abbr = game["home_abbr"]
+    away_abbr = game["away_abbr"]
+    video_url = game.get("video_url", "")
+
+    # Fetch all rallies for the game
+    all_rallies = db.get_rallies_for_game(game["id"])
+    if not all_rallies:
+        st.info("No rally data available. Record rallies in the Rally Log tab first.")
+        return
+
+    # Fetch detections in one batch
+    detections_map = db.get_detections_for_game(game["id"])
+
+    # ── Summary Stats ────────────────────────────────────────────────────────
+    st.subheader("Game Summary")
+
+    home_pts = sum(1 for r in all_rallies if r.get("scoring_team") == home_abbr)
+    away_pts = sum(1 for r in all_rallies if r.get("scoring_team") == away_abbr)
+
+    def _count_type(rallies, team, play_type_substr):
+        return sum(1 for r in rallies
+                   if r.get("scoring_team") == team
+                   and r.get("play_type", "") and play_type_substr in r["play_type"].lower())
+
+    home_aces = _count_type(all_rallies, home_abbr, "ace")
+    away_aces = _count_type(all_rallies, away_abbr, "ace")
+    home_kills = _count_type(all_rallies, home_abbr, "kill")
+    away_kills = _count_type(all_rallies, away_abbr, "kill")
+    home_svc_err = _count_type(all_rallies, home_abbr, "service error")
+    away_svc_err = _count_type(all_rallies, away_abbr, "service error")
+
+    # Sideout %: points won while receiving
+    home_receiving = [r for r in all_rallies if r.get("serving_team") == away_abbr]
+    away_receiving = [r for r in all_rallies if r.get("serving_team") == home_abbr]
+    home_so_won = sum(1 for r in home_receiving if r.get("scoring_team") == home_abbr)
+    away_so_won = sum(1 for r in away_receiving if r.get("scoring_team") == away_abbr)
+    home_so_pct = f"{home_so_won / len(home_receiving) * 100:.0f}%" if home_receiving else "--"
+    away_so_pct = f"{away_so_won / len(away_receiving) * 100:.0f}%" if away_receiving else "--"
+
+    # Longest scoring run per team
+    def _longest_run(rallies, team):
+        best = 0
+        current = 0
+        for r in rallies:
+            if r.get("scoring_team") == team:
+                current += 1
+                best = max(best, current)
+            else:
+                current = 0
+        return best
+
+    home_run = _longest_run(all_rallies, home_abbr)
+    away_run = _longest_run(all_rallies, away_abbr)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**{home_abbr}**")
+        st.write(f"Points: **{home_pts}** | Aces: **{home_aces}** | Kills: **{home_kills}** | Svc Err: **{home_svc_err}**")
+        st.write(f"Sideout: **{home_so_pct}** | Longest Run: **{home_run}**")
+    with c2:
+        st.markdown(f"**{away_abbr}**")
+        st.write(f"Points: **{away_pts}** | Aces: **{away_aces}** | Kills: **{away_kills}** | Svc Err: **{away_svc_err}**")
+        st.write(f"Sideout: **{away_so_pct}** | Longest Run: **{away_run}**")
+
+    st.divider()
+
+    # ── Filters ──────────────────────────────────────────────────────────────
+    f1, f2, f3 = st.columns(3)
+    set_options = ["All"] + [f"Set {s['set_number']}" for s in sets]
+    with f1:
+        set_filter = st.selectbox("Set", set_options, key="pbp_set_filter")
+    play_types_in_data = sorted({r.get("play_type", "") for r in all_rallies if r.get("play_type")})
+    with f2:
+        type_filter = st.selectbox("Play Type", ["All"] + play_types_in_data, key="pbp_type_filter")
+    with f3:
+        team_filter = st.selectbox("Scoring Team", ["All", home_abbr, away_abbr], key="pbp_team_filter")
+
+    # Apply filters
+    filtered = all_rallies
+    if set_filter != "All":
+        set_num = int(set_filter.split()[-1])
+        filtered = [r for r in filtered if r.get("set_number") == set_num]
+    if type_filter != "All":
+        filtered = [r for r in filtered if r.get("play_type") == type_filter]
+    if team_filter != "All":
+        filtered = [r for r in filtered if r.get("scoring_team") == team_filter]
+
+    st.caption(f"Showing {len(filtered)} of {len(all_rallies)} rallies")
+
+    # ── Build momentum map: mark rallies that are part of a 3+ run ────────
+    # We scan all_rallies (not filtered) so momentum context is correct
+    momentum_info = {}  # rally_id -> "X-0 run for TEAM"
+    run_start = 0
+    run_team = None
+    for i, r in enumerate(all_rallies):
+        team = r.get("scoring_team", "")
+        if team == run_team:
+            continue  # extend current run
+        else:
+            # End previous run
+            run_len = i - run_start
+            if run_len >= 3 and run_team:
+                for j in range(run_start, i):
+                    momentum_info[all_rallies[j]["id"]] = f"{run_len}-0 run for {run_team}"
+            run_start = i
+            run_team = team
+    # Final run
+    run_len = len(all_rallies) - run_start
+    if run_len >= 3 and run_team:
+        for j in range(run_start, len(all_rallies)):
+            momentum_info[all_rallies[j]["id"]] = f"{run_len}-0 run for {run_team}"
+
+    # ── Play-by-play cards ───────────────────────────────────────────────────
+    for r in filtered:
+        rally_id = r["id"]
+        set_num = r.get("set_number", "?")
+        rally_num = r.get("rally_number", "?")
+        score_before = r.get("score_before", "")
+        score_after = r.get("score_after", "")
+        play_type = r.get("play_type", "")
+        scoring_team = r.get("scoring_team", "")
+        key_player = r.get("key_player", "")
+        serving_team = r.get("serving_team", "")
+        is_sideout = r.get("is_sideout", 0)
+        video_time = r.get("video_time", "")
+
+        # Timestamp link
+        ts_url = _video_timestamp_url(video_url, video_time) if video_time else None
+        if ts_url:
+            ts_display = f"[{video_time}]({ts_url})"
+        elif video_time:
+            ts_display = video_time
+        else:
+            ts_display = ""
+
+        # Badge color
+        badge_color = _play_type_color(play_type)
+        badge_html = (f'<span style="background:{badge_color};color:#fff;'
+                      f'padding:2px 8px;border-radius:10px;font-size:0.8em;">'
+                      f'{play_type or "Rally"}</span>')
+
+        # Description
+        desc = _format_play_description(r, home_abbr, away_abbr)
+
+        # Serving indicator
+        serve_icon = "serve" if serving_team else ""
+
+        # Build the row
+        score_text = f"{score_before} → {score_after}" if score_before and score_after else score_after or ""
+
+        # Player display (key_player already has # and team info)
+        player_display = key_player if key_player else ""
+
+        # Momentum marker
+        momentum = momentum_info.get(rally_id, "")
+
+        # Render the play card
+        row_bg = "#1e1e2e" if r in filtered else "#111"
+        momentum_html = (f' <span style="background:#ff6f00;color:#fff;padding:2px 6px;'
+                         f'border-radius:8px;font-size:0.75em;">{momentum}</span>'
+                         if momentum else "")
+        sideout_html = (' <span style="background:#00897b;color:#fff;padding:2px 6px;'
+                        'border-radius:8px;font-size:0.75em;">Sideout</span>'
+                        if is_sideout else "")
+        serve_html = (f' <span style="color:#aaa;font-size:0.8em;">'
+                      f'Serving: {serving_team}</span>' if serving_team else "")
+
+        st.markdown(
+            f"**S{set_num} R{rally_num}** &nbsp; {ts_display} &nbsp; "
+            f"**{score_text}** &nbsp; {badge_html}{momentum_html}{sideout_html} "
+            f"&nbsp; {desc}"
+            f"{(' &nbsp; **' + player_display + '**') if player_display else ''}"
+            f" &nbsp;{serve_html}",
+            unsafe_allow_html=True,
+        )
+
+        # Player detections expander
+        dets = detections_map.get(rally_id, [])
+        if dets:
+            with st.expander(f"Player detections ({len(dets)})", expanded=False):
+                det_df = pd.DataFrame(dets)[
+                    [c for c in ["team", "jersey_number", "zone", "confidence", "role", "track_id"]
+                     if c in pd.DataFrame(dets).columns]
+                ]
+                st.dataframe(det_df, hide_index=True, use_container_width=True)
+
+        st.markdown("<hr style='margin:4px 0;border-color:#333;'>", unsafe_allow_html=True)
 
 
 def _tab_match_overview(game, sets):
@@ -1160,7 +1463,16 @@ def page_teams():
                     st.error("Name required.")
 
     teams = db.get_all_teams()
+
+    # Conference filter
+    conferences = sorted(set(t.get("conference") or "" for t in teams))
+    conferences = [c for c in conferences if c]  # remove blanks
+    conf_filter = st.selectbox("Filter by conference", ["All"] + conferences, key="teams_conf_filter")
+
     for t in teams:
+        if conf_filter != "All" and (t.get("conference") or "") != conf_filter:
+            continue
+
         w, l = db.get_team_record(t["id"])
         with st.expander(f"{t.get('abbreviation', '')} — {t['name']}  ({w}W-{l}L)"):
             with st.form(f"edit_team_{t['id']}"):
@@ -1180,6 +1492,14 @@ def page_teams():
                 st.write(f"**Roster ({len(players)} players)**")
                 for p in players:
                     st.write(f"  #{p['jersey_number']} {p['name']} — {p.get('position', '')}")
+
+            # Delete team
+            with st.popover("Delete Team"):
+                st.warning(f"Delete **{t['name']}** and all its players? All games this team played in will also be deleted (including their sets, rallies, stats, and detections).")
+                if st.button("Confirm Delete", key=f"teams_del_{t['id']}", type="primary"):
+                    db.delete_team(t["id"])
+                    st.success(f"Team '{t['name']}' deleted.")
+                    st.rerun()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
