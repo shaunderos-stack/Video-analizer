@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.db
+*.pt
+downloads/
+clips/
+frames/
+rallies/
+zones/
+output/
+*.jpg
+*.png
+*.mp4
